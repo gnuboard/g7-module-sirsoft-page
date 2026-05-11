@@ -1,29 +1,113 @@
 <?php
 
-namespace Modules\Sirsoft\Page\Tests\Unit\Repositories;
+namespace Modules\Sirsoft\Page\Tests\Feature\Repositories;
 
 use App\Models\User;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Route;
 use Modules\Sirsoft\Page\Models\Page;
 use Modules\Sirsoft\Page\Repositories\PageRepository;
-use Modules\Sirsoft\Page\Tests\ModuleTestCase;
+use Tests\TestCase;
 
 /**
- * PageRepository 키워드 검색 단위 테스트
+ * PageRepository 키워드 검색 통합 테스트
  *
- * searchByKeyword() 및 countByKeyword()가 제목과 본문 모두 검색하는지 검증합니다.
+ * searchByKeyword() 및 countByKeyword()가 제목/본문/슬러그를 검색하는지 검증합니다.
+ *
+ * 주의: DatabaseTransactions 대신 RefreshDatabase 사용 — InnoDB FULLTEXT 인덱스는
+ * 커밋된 데이터만 인덱싱하므로, 트랜잭션 내부에서 MATCH 조회는 0 을 반환한다.
+ * 따라서 이 스위트만 매 테스트 fresh DB + commit 되는 INSERT 로 FULLTEXT 경로를
+ * 실제 검증한다. (ModuleTestCase 의 DatabaseTransactions 와 상호배타.)
  */
-class PageRepositorySearchTest extends ModuleTestCase
+class PageRepositorySearchTest extends TestCase
 {
+    use RefreshDatabase;
+
     private PageRepository $repository;
 
     private User $user;
+
+    /**
+     * 트랜잭션 wrapping 비활성화.
+     *
+     * 기본 RefreshDatabase 는 테스트마다 beginTransaction/rollBack 으로 격리하지만,
+     * MySQL InnoDB FULLTEXT 는 커밋된 데이터만 인덱싱하므로 트랜잭션 내부의 INSERT 는
+     * MATCH 조회에서 보이지 않는다. 빈 배열을 반환해 transaction wrapping 을 끄고,
+     * tearDown 에서 수동으로 insert 된 레코드를 정리한다.
+     *
+     * @return array<string>
+     */
+    protected function connectionsToTransact(): array
+    {
+        return [];
+    }
 
     protected function setUp(): void
     {
         parent::setUp();
 
+        // 모듈 오토로드 등록 (ModuleTestCase 와 동일 로직 — 상속 대신 복제)
+        $this->registerModuleAutoload();
+
+        // 모듈 ServiceProvider 등록 (Repository 바인딩)
+        $this->app->register(\Modules\Sirsoft\Page\Providers\PageServiceProvider::class);
+
+        // 모듈 마이그레이션 실행 (pages 테이블)
+        $this->artisan('migrate', [
+            '--path' => dirname(__DIR__, 3).'/database/migrations',
+            '--realpath' => true,
+        ]);
+
         $this->repository = app(PageRepository::class);
         $this->user = User::factory()->create();
+    }
+
+    /**
+     * 수동 정리: connectionsToTransact=[] 로 인해 transaction rollback 이 없으므로
+     * 테스트에서 insert 한 Page + User 를 직접 제거해 격리를 유지한다.
+     */
+    protected function tearDown(): void
+    {
+        Page::query()->withTrashed()->forceDelete();
+
+        if (isset($this->user)) {
+            User::where('id', $this->user->id)->delete();
+        }
+
+        parent::tearDown();
+    }
+
+    /**
+     * 모듈 오토로드를 등록합니다 (ModuleTestCase 와 동일 로직 사본).
+     */
+    private function registerModuleAutoload(): void
+    {
+        $moduleBasePath = dirname(__DIR__, 3);
+
+        spl_autoload_register(function ($class) use ($moduleBasePath) {
+            $prefix = 'Modules\\Sirsoft\\Page\\';
+            $len = strlen($prefix);
+
+            if (strncmp($prefix, $class, $len) !== 0) {
+                return;
+            }
+
+            $relativeClass = substr($class, $len);
+
+            if (str_starts_with($relativeClass, 'Database\\Factories\\')) {
+                $factoryClass = substr($relativeClass, strlen('Database\\Factories\\'));
+                $file = $moduleBasePath.'/database/factories/'.str_replace('\\', '/', $factoryClass).'.php';
+            } elseif (str_starts_with($relativeClass, 'Database\\Seeders\\')) {
+                $seederClass = substr($relativeClass, strlen('Database\\Seeders\\'));
+                $file = $moduleBasePath.'/database/seeders/'.str_replace('\\', '/', $seederClass).'.php';
+            } else {
+                $file = $moduleBasePath.'/src/'.str_replace('\\', '/', $relativeClass).'.php';
+            }
+
+            if (file_exists($file)) {
+                require $file;
+            }
+        });
     }
 
     /**
